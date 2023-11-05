@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 
 	"github.com/ThreeDotsLabs/go-event-driven/common/clients"
 	"github.com/ThreeDotsLabs/go-event-driven/common/clients/receipts"
@@ -18,6 +19,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 )
 
 type ReceiptsClient struct {
@@ -98,6 +100,22 @@ func main() {
 		appendToTrackerTopic = "append-to-tracker"
 	)
 
+	c, err := clients.NewClients(os.Getenv("GATEWAY_ADDR"), nil)
+	if err != nil {
+		panic(err)
+	}
+
+	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
+	defer cancel()
+
+	workerPool, ctx := errgroup.WithContext(ctx)
+
+	router, err := message.NewRouter(message.RouterConfig{}, logger)
+	if err != nil {
+		panic(err)
+	}
+
 	issueReceiptSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
 		Client:        rdb,
 		ConsumerGroup: receiptsConsumerGroup,
@@ -105,6 +123,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	receiptsClient := NewReceiptsClient(c)
+	workerPool.Go(func() error {
+		processIssueReceipt(issueReceiptSub, router, receiptsClient.IssueReceipt)
+		return nil
+	})
 
 	appendToTrackerSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
 		Client:        rdb,
@@ -114,24 +138,25 @@ func main() {
 		panic(err)
 	}
 
+	spreadsheetsClient := NewSpreadsheetsClient(c)
+	workerPool.Go(func() error {
+		processTrackerAppend(appendToTrackerSub, router, spreadsheetsClient.AppendRow)
+		return nil
+	})
+
+	workerPool.Go(func() error {
+		return router.Run(ctx)
+	})
+
 	publisher, err := redisstream.NewPublisher(redisstream.PublisherConfig{Client: rdb}, logger)
 	if err != nil {
 		panic(err)
 	}
 
 	e := commonHTTP.NewEcho()
-
-	c, err := clients.NewClients(os.Getenv("GATEWAY_ADDR"), nil)
-	if err != nil {
-		panic(err)
-	}
-
-	receiptsClient := NewReceiptsClient(c)
-	spreadsheetsClient := NewSpreadsheetsClient(c)
-
-	ctx := context.Background()
-	go processIssueReceipt(ctx, issueReceiptSub, logger, receiptsClient.IssueReceipt)
-	go processTrackerAppend(ctx, appendToTrackerSub, logger, spreadsheetsClient.AppendRow)
+	e.GET("/health", func(c echo.Context) error {
+		return c.String(http.StatusOK, "ok")
+	})
 
 	e.POST("/tickets-confirmation", func(c echo.Context) error {
 		var request TicketsConfirmationRequest
@@ -155,17 +180,26 @@ func main() {
 
 	logrus.Info("Server starting...")
 
-	if err := e.Start(":8080"); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	workerPool.Go(func() error {
+		<-router.Running()
+
+		if err := e.Start(":8080"); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(err)
+		}
+		return nil
+	})
+
+	workerPool.Go(func() error {
+		<-ctx.Done()
+		return e.Shutdown(ctx)
+	})
+
+	if err := workerPool.Wait(); err != nil {
 		panic(err)
 	}
 }
 
-func processIssueReceipt(ctx context.Context, sub message.Subscriber, logger watermill.LoggerAdapter, action func(ctx context.Context, ticketID string) error) {
-	router, err := message.NewRouter(message.RouterConfig{}, logger)
-	if err != nil {
-		panic(err)
-	}
-
+func processIssueReceipt(sub message.Subscriber, router *message.Router, action func(ctx context.Context, ticketID string) error) {
 	router.AddNoPublisherHandler(
 		"issue_receipt_handler",
 		issueReceiptTopic,
@@ -175,18 +209,10 @@ func processIssueReceipt(ctx context.Context, sub message.Subscriber, logger wat
 		},
 	)
 
-	if err := router.Run(ctx); err != nil {
-		panic(err)
-	}
 }
 
-func processTrackerAppend(ctx context.Context, sub message.Subscriber, logger watermill.LoggerAdapter, action func(ctx context.Context, spreadSheetName string, row []string) error) {
+func processTrackerAppend(sub message.Subscriber, router *message.Router, action func(ctx context.Context, spreadSheetName string, row []string) error) {
 	const spreadsheetName = "tickets-to-print"
-
-	router, err := message.NewRouter(message.RouterConfig{}, logger)
-	if err != nil {
-		panic(err)
-	}
 
 	router.AddNoPublisherHandler(
 		"tracker_append_handler",
@@ -196,8 +222,4 @@ func processTrackerAppend(ctx context.Context, sub message.Subscriber, logger wa
 			return action(msg.Context(), spreadsheetName, []string{string(msg.Payload)})
 		},
 	)
-
-	if err := router.Run(ctx); err != nil {
-		panic(err)
-	}
 }
