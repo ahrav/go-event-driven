@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/ThreeDotsLabs/go-event-driven/common/clients"
 	"github.com/ThreeDotsLabs/go-event-driven/common/clients/receipts"
@@ -17,6 +18,7 @@ import (
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill-redisstream/pkg/redisstream"
 	"github.com/ThreeDotsLabs/watermill/message"
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
@@ -106,10 +108,19 @@ type TicketsConfirmationRequest struct {
 	Tickets []Ticket `json:"tickets"`
 }
 
+type Header struct {
+	ID          string `json:"id"`
+	PublishedAt string `json:"published_at"`
+}
+
+type TicketBookingConfirmedEvent struct {
+	Header Header `json:"header"`
+	Ticket
+}
+
 const (
 	// Topics.
-	issueReceiptTopic    = "issue-receipt"
-	appendToTrackerTopic = "append-to-tracker"
+	TicketBookingConfirmed = "TicketBookingConfirmed"
 
 	// Consumer groups.
 	receiptsConsumerGroup = "receipts"
@@ -122,11 +133,6 @@ func main() {
 	logger := log.NewWatermill(logrus.NewEntry(logrus.StandardLogger()))
 
 	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR")})
-
-	const (
-		issueReceiptTopic    = "issue-receipt"
-		appendToTrackerTopic = "append-to-tracker"
-	)
 
 	c, err := clients.NewClients(os.Getenv("GATEWAY_ADDR"), nil)
 	if err != nil {
@@ -194,29 +200,20 @@ func main() {
 		}
 
 		for _, ticket := range request.Tickets {
-			receiptReq, err := json.Marshal(IssueReceiptRequest{
-				TicketID: ticket.TicketId,
-				Price:    ticket.Price,
+			ticketBookingEvent, err := json.Marshal(TicketBookingConfirmedEvent{
+				Header: Header{
+					ID:          uuid.NewString(),
+					PublishedAt: time.Now().Format(time.RFC3339),
+				},
+				Ticket: ticket,
 			})
 			if err != nil {
 				logger.Error("error marshalling IssueReceiptRequest", err, watermill.LogFields{"ticket": ticket})
 				continue
 			}
 
-			printReq, err := json.Marshal(PrintTicketPayload{
-				TicketID:      ticket.TicketId,
-				CustomerEmail: ticket.CustomerEmail,
-				Price:         ticket.Price,
-			})
-			if err != nil {
-				logger.Error("error marshalling PrintTicketPayload", err, watermill.LogFields{"ticket": ticket})
-				continue
-			}
-
-			if err := publisher.Publish(issueReceiptTopic, message.NewMessage(watermill.NewUUID(), receiptReq)); err != nil {
-				return err
-			}
-			if err := publisher.Publish(appendToTrackerTopic, message.NewMessage(watermill.NewUUID(), printReq)); err != nil {
+			msg := message.NewMessage(watermill.NewUUID(), ticketBookingEvent)
+			if err := publisher.Publish(TicketBookingConfirmed, msg); err != nil {
 				return err
 			}
 		}
@@ -248,7 +245,7 @@ func main() {
 func processIssueReceipt(sub message.Subscriber, router *message.Router, action func(ctx context.Context, request IssueReceiptRequest) error) {
 	router.AddNoPublisherHandler(
 		"issue_receipt_handler",
-		issueReceiptTopic,
+		TicketBookingConfirmed,
 		sub,
 		func(msg *message.Message) error {
 			var req IssueReceiptRequest
@@ -266,7 +263,7 @@ func processTrackerAppend(sub message.Subscriber, router *message.Router, action
 
 	router.AddNoPublisherHandler(
 		"tracker_append_handler",
-		appendToTrackerTopic,
+		TicketBookingConfirmed,
 		sub,
 		func(msg *message.Message) error {
 			var payload PrintTicketPayload
