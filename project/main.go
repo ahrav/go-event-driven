@@ -130,8 +130,8 @@ func main() {
 	spreadsheetsClient := NewSpreadsheetsClient(c)
 
 	ctx := context.Background()
-	go processIssueReceipt(ctx, issueReceiptSub, receiptsClient.IssueReceipt)
-	go processTrackerAppend(ctx, appendToTrackerSub, spreadsheetsClient.AppendRow)
+	go processIssueReceipt(ctx, issueReceiptSub, logger, receiptsClient.IssueReceipt)
+	go processTrackerAppend(ctx, appendToTrackerSub, logger, spreadsheetsClient.AppendRow)
 
 	e.POST("/tickets-confirmation", func(c echo.Context) error {
 		var request TicketsConfirmationRequest
@@ -160,37 +160,44 @@ func main() {
 	}
 }
 
-func processIssueReceipt(ctx context.Context, sub message.Subscriber, action func(ctx context.Context, ticketID string) error) {
-	messages, err := sub.Subscribe(ctx, issueReceiptTopic)
+func processIssueReceipt(ctx context.Context, sub message.Subscriber, logger watermill.LoggerAdapter, action func(ctx context.Context, ticketID string) error) {
+	router, err := message.NewRouter(message.RouterConfig{}, logger)
 	if err != nil {
 		panic(err)
 	}
 
-	for msg := range messages {
-		ticketID := string(msg.Payload)
+	router.AddNoPublisherHandler(
+		"issue_receipt_handler",
+		issueReceiptTopic,
+		sub,
+		func(msg *message.Message) error {
+			return action(msg.Context(), string(msg.Payload))
+		},
+	)
 
-		if err := action(msg.Context(), ticketID); err != nil {
-			msg.Nack()
-		} else {
-			msg.Ack()
-		}
+	if err := router.Run(ctx); err != nil {
+		panic(err)
 	}
 }
 
-func processTrackerAppend(ctx context.Context, sub message.Subscriber, action func(ctx context.Context, spreadSheetName string, row []string) error) {
+func processTrackerAppend(ctx context.Context, sub message.Subscriber, logger watermill.LoggerAdapter, action func(ctx context.Context, spreadSheetName string, row []string) error) {
 	const spreadsheetName = "tickets-to-print"
-	messages, err := sub.Subscribe(ctx, appendToTrackerTopic)
+
+	router, err := message.NewRouter(message.RouterConfig{}, logger)
 	if err != nil {
 		panic(err)
 	}
 
-	for msg := range messages {
-		ticketID := string(msg.Payload)
+	router.AddNoPublisherHandler(
+		"tracker_append_handler",
+		appendToTrackerTopic,
+		sub,
+		func(msg *message.Message) error {
+			return action(msg.Context(), spreadsheetName, []string{string(msg.Payload)})
+		},
+	)
 
-		if err := action(msg.Context(), spreadsheetName, []string{ticketID}); err != nil {
-			msg.Nack()
-		} else {
-			msg.Ack()
-		}
+	if err := router.Run(ctx); err != nil {
+		panic(err)
 	}
 }
