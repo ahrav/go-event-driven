@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -32,9 +33,23 @@ func NewReceiptsClient(clients *clients.Clients) ReceiptsClient {
 	}
 }
 
-func (c ReceiptsClient) IssueReceipt(ctx context.Context, ticketID string) error {
+type Money struct {
+	Amount   string `json:"amount"`
+	Currency string `json:"currency"`
+}
+
+type IssueReceiptRequest struct {
+	TicketID string `json:"ticket_id"`
+	Price    Money  `json:"price"`
+}
+
+func (c ReceiptsClient) IssueReceipt(ctx context.Context, request IssueReceiptRequest) error {
 	body := receipts.PutReceiptsJSONRequestBody{
-		TicketId: ticketID,
+		TicketId: request.TicketID,
+		Price: receipts.Money{
+			MoneyAmount:   request.Price.Amount,
+			MoneyCurrency: request.Price.Currency,
+		},
 	}
 
 	receiptsResp, err := c.clients.Receipts.PutReceiptsWithResponse(ctx, body)
@@ -58,6 +73,12 @@ func NewSpreadsheetsClient(clients *clients.Clients) SpreadsheetsClient {
 	}
 }
 
+type PrintTicketPayload struct {
+	TicketID      string `json:"ticket_id"`
+	CustomerEmail string `json:"customer_email"`
+	Price         Money  `json:"price"`
+}
+
 func (c SpreadsheetsClient) AppendRow(ctx context.Context, spreadsheetName string, row []string) error {
 	request := spreadsheets.PostSheetsSheetRowsJSONRequestBody{
 		Columns: row,
@@ -74,8 +95,15 @@ func (c SpreadsheetsClient) AppendRow(ctx context.Context, spreadsheetName strin
 	return nil
 }
 
+type Ticket struct {
+	TicketId      string `json:"ticket_id"`
+	Status        string `json:"status"`
+	CustomerEmail string `json:"customer_email"`
+	Price         Money  `json:"price"`
+}
+
 type TicketsConfirmationRequest struct {
-	Tickets []string `json:"tickets"`
+	Tickets []Ticket `json:"tickets"`
 }
 
 const (
@@ -158,7 +186,7 @@ func main() {
 		return c.String(http.StatusOK, "ok")
 	})
 
-	e.POST("/tickets-confirmation", func(c echo.Context) error {
+	e.POST("/tickets-status", func(c echo.Context) error {
 		var request TicketsConfirmationRequest
 		err := c.Bind(&request)
 		if err != nil {
@@ -166,11 +194,29 @@ func main() {
 		}
 
 		for _, ticket := range request.Tickets {
-			msg := message.NewMessage(watermill.NewUUID(), []byte(ticket))
-			if err := publisher.Publish(issueReceiptTopic, msg); err != nil {
+			receiptReq, err := json.Marshal(IssueReceiptRequest{
+				TicketID: ticket.TicketId,
+				Price:    ticket.Price,
+			})
+			if err != nil {
+				logger.Error("error marshalling IssueReceiptRequest", err, watermill.LogFields{"ticket": ticket})
+				continue
+			}
+
+			printReq, err := json.Marshal(PrintTicketPayload{
+				TicketID:      ticket.TicketId,
+				CustomerEmail: ticket.CustomerEmail,
+				Price:         ticket.Price,
+			})
+			if err != nil {
+				logger.Error("error marshalling PrintTicketPayload", err, watermill.LogFields{"ticket": ticket})
+				continue
+			}
+
+			if err := publisher.Publish(issueReceiptTopic, message.NewMessage(watermill.NewUUID(), receiptReq)); err != nil {
 				return err
 			}
-			if err := publisher.Publish(appendToTrackerTopic, msg); err != nil {
+			if err := publisher.Publish(appendToTrackerTopic, message.NewMessage(watermill.NewUUID(), printReq)); err != nil {
 				return err
 			}
 		}
@@ -199,13 +245,17 @@ func main() {
 	}
 }
 
-func processIssueReceipt(sub message.Subscriber, router *message.Router, action func(ctx context.Context, ticketID string) error) {
+func processIssueReceipt(sub message.Subscriber, router *message.Router, action func(ctx context.Context, request IssueReceiptRequest) error) {
 	router.AddNoPublisherHandler(
 		"issue_receipt_handler",
 		issueReceiptTopic,
 		sub,
 		func(msg *message.Message) error {
-			return action(msg.Context(), string(msg.Payload))
+			var req IssueReceiptRequest
+			if err := json.Unmarshal(msg.Payload, &req); err != nil {
+				return err
+			}
+			return action(msg.Context(), req)
 		},
 	)
 
@@ -219,7 +269,11 @@ func processTrackerAppend(sub message.Subscriber, router *message.Router, action
 		appendToTrackerTopic,
 		sub,
 		func(msg *message.Message) error {
-			return action(msg.Context(), spreadsheetName, []string{string(msg.Payload)})
+			var payload PrintTicketPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				return err
+			}
+			return action(msg.Context(), spreadsheetName, []string{payload.TicketID, payload.CustomerEmail, payload.Price.Amount, payload.Price.Currency})
 		},
 	)
 }
