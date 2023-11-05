@@ -1,3 +1,3 @@
-exercise_id = "beec0266-3ead-4307-b1be-8514ca466142"
-directory = "03-message-broker/01-choosing-the-message-broker"
-is_text_only = true
+exercise_id = "f2eca145-e8cd-49c5-bdfa-384d33aa0bea"
+directory = "03-message-broker/05-consumer-groups"
+is_text_only = false
