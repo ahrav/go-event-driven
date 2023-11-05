@@ -29,14 +29,16 @@ func Subscribe(
 	})
 
 	orderConfirmationSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
-		Client: rdb,
+		Client:        rdb,
+		ConsumerGroup: "notifications",
 	}, logger)
 	if err != nil {
 		return err
 	}
 
 	spreadsheetSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
-		Client: rdb,
+		Client:        rdb,
+		ConsumerGroup: "spreadsheets",
 	}, logger)
 	if err != nil {
 		return err
