@@ -5,7 +5,7 @@ go 1.21
 toolchain go1.21.0
 
 require (
-	github.com/ThreeDotsLabs/go-event-driven v0.0.11
+	github.com/ThreeDotsLabs/go-event-driven v0.0.12
 	github.com/ThreeDotsLabs/watermill v1.3.5
 	github.com/ThreeDotsLabs/watermill-redisstream v1.2.2
 	github.com/labstack/echo/v4 v4.11.2

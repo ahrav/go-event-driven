@@ -25,14 +25,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type ReceiptsClient struct {
-	clients *clients.Clients
-}
+type ReceiptsClient struct{ clients *clients.Clients }
 
 func NewReceiptsClient(clients *clients.Clients) ReceiptsClient {
-	return ReceiptsClient{
-		clients: clients,
-	}
+	return ReceiptsClient{clients: clients}
 }
 
 type Money struct {
@@ -65,14 +61,10 @@ func (c ReceiptsClient) IssueReceipt(ctx context.Context, request IssueReceiptRe
 	return nil
 }
 
-type SpreadsheetsClient struct {
-	clients *clients.Clients
-}
+type SpreadsheetsClient struct{ clients *clients.Clients }
 
 func NewSpreadsheetsClient(clients *clients.Clients) SpreadsheetsClient {
-	return SpreadsheetsClient{
-		clients: clients,
-	}
+	return SpreadsheetsClient{clients: clients}
 }
 
 type PrintTicketPayload struct {
@@ -118,13 +110,23 @@ type TicketBookingConfirmedEvent struct {
 	Ticket
 }
 
+type TicketBookingCanceledEvent struct {
+	Header Header `json:"header"`
+	Ticket
+}
+
 const (
 	// Topics.
+
+	// TicketBookingConfirmed is a topic for events published when a ticket booking is confirmed.
 	TicketBookingConfirmed = "TicketBookingConfirmed"
+	// TicketBookingCanceled is a topic for events published when a ticket booking is canceled.
+	TicketBookingCanceled = "TicketBookingCanceled"
 
 	// Consumer groups.
 	receiptsConsumerGroup = "receipts"
 	trackerConsumerGroup  = "tracker"
+	refundsConsumerGroup  = "refunds"
 )
 
 func main() {
@@ -172,9 +174,22 @@ func main() {
 		panic(err)
 	}
 
+	refundSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
+		Client:        rdb,
+		ConsumerGroup: refundsConsumerGroup,
+	}, logger)
+	if err != nil {
+		panic(err)
+	}
+
 	spreadsheetsClient := NewSpreadsheetsClient(c)
 	workerPool.Go(func() error {
 		processTrackerAppend(appendToTrackerSub, router, spreadsheetsClient.AppendRow)
+		return nil
+	})
+
+	workerPool.Go(func() error {
+		processRefundsAppend(refundSub, router, spreadsheetsClient.AppendRow)
 		return nil
 	})
 
@@ -200,22 +215,42 @@ func main() {
 		}
 
 		for _, ticket := range request.Tickets {
-			ticketBookingEvent, err := json.Marshal(TicketBookingConfirmedEvent{
-				Header: Header{
-					ID:          uuid.NewString(),
-					PublishedAt: time.Now().Format(time.RFC3339),
-				},
-				Ticket: ticket,
-			})
-			if err != nil {
-				logger.Error("error marshalling IssueReceiptRequest", err, watermill.LogFields{"ticket": ticket})
-				continue
+			if ticket.Status == "confirmed" {
+				ticketBookingEvent, err := json.Marshal(TicketBookingConfirmedEvent{
+					Header: Header{
+						ID:          uuid.NewString(),
+						PublishedAt: time.Now().Format(time.RFC3339),
+					},
+					Ticket: ticket,
+				})
+				if err != nil {
+					logger.Error("error marshalling IssueReceiptRequest", err, watermill.LogFields{"ticket": ticket})
+					continue
+				}
+
+				msg := message.NewMessage(watermill.NewUUID(), ticketBookingEvent)
+				if err := publisher.Publish(TicketBookingConfirmed, msg); err != nil {
+					return err
+				}
+			} else {
+				ticketCanceledEvent, err := json.Marshal(TicketBookingCanceledEvent{
+					Header: Header{
+						ID:          uuid.NewString(),
+						PublishedAt: time.Now().Format(time.RFC3339),
+					},
+					Ticket: ticket,
+				})
+				if err != nil {
+					logger.Error("error marshalling IssueReceiptRequest", err, watermill.LogFields{"ticket": ticket})
+					continue
+				}
+
+				msg := message.NewMessage(watermill.NewUUID(), ticketCanceledEvent)
+				if err := publisher.Publish(TicketBookingCanceled, msg); err != nil {
+					return err
+				}
 			}
 
-			msg := message.NewMessage(watermill.NewUUID(), ticketBookingEvent)
-			if err := publisher.Publish(TicketBookingConfirmed, msg); err != nil {
-				return err
-			}
 		}
 
 		return c.NoContent(http.StatusOK)
@@ -242,7 +277,11 @@ func main() {
 	}
 }
 
-func processIssueReceipt(sub message.Subscriber, router *message.Router, action func(ctx context.Context, request IssueReceiptRequest) error) {
+func processIssueReceipt(
+	sub message.Subscriber,
+	router *message.Router,
+	action func(ctx context.Context, request IssueReceiptRequest) error,
+) {
 	router.AddNoPublisherHandler(
 		"issue_receipt_handler",
 		TicketBookingConfirmed,
@@ -258,7 +297,11 @@ func processIssueReceipt(sub message.Subscriber, router *message.Router, action 
 
 }
 
-func processTrackerAppend(sub message.Subscriber, router *message.Router, action func(ctx context.Context, spreadSheetName string, row []string) error) {
+func processTrackerAppend(
+	sub message.Subscriber,
+	router *message.Router,
+	action func(ctx context.Context, spreadSheetName string, row []string) error,
+) {
 	const spreadsheetName = "tickets-to-print"
 
 	router.AddNoPublisherHandler(
@@ -270,7 +313,36 @@ func processTrackerAppend(sub message.Subscriber, router *message.Router, action
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				return err
 			}
-			return action(msg.Context(), spreadsheetName, []string{payload.TicketID, payload.CustomerEmail, payload.Price.Amount, payload.Price.Currency})
+			return action(
+				msg.Context(),
+				spreadsheetName,
+				[]string{payload.TicketID, payload.CustomerEmail, payload.Price.Amount, payload.Price.Currency},
+			)
+		},
+	)
+}
+
+func processRefundsAppend(
+	sub message.Subscriber,
+	router *message.Router,
+	action func(ctx context.Context, spreadSheetName string, row []string) error,
+) {
+	const spreadsheetName = "tickets-to-refund"
+
+	router.AddNoPublisherHandler(
+		"refund_handler",
+		TicketBookingCanceled,
+		sub,
+		func(msg *message.Message) error {
+			var payload PrintTicketPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				return err
+			}
+			return action(
+				msg.Context(),
+				spreadsheetName,
+				[]string{payload.TicketID, payload.CustomerEmail, payload.Price.Amount, payload.Price.Currency},
+			)
 		},
 	)
 }
