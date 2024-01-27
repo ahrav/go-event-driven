@@ -89,9 +89,16 @@ func (c SpreadsheetsClient) AppendRow(ctx context.Context, spreadsheetName strin
 	return nil
 }
 
+type Status string
+
+const (
+	StatusConfirmed Status = "confirmed"
+	StatusCanceled  Status = "canceled"
+)
+
 type Ticket struct {
 	TicketId      string `json:"ticket_id"`
-	Status        string `json:"status"`
+	Status        Status `json:"status"`
 	CustomerEmail string `json:"customer_email"`
 	Price         Money  `json:"price"`
 }
@@ -215,8 +222,15 @@ func main() {
 		}
 
 		for _, ticket := range request.Tickets {
-			if ticket.Status == "confirmed" {
-				ticketBookingEvent, err := json.Marshal(TicketBookingConfirmedEvent{
+			var (
+				topic string
+				msg   *message.Message
+				err   error
+			)
+			switch ticket.Status {
+			case StatusConfirmed:
+				var ticketBookingEvent []byte
+				ticketBookingEvent, err = json.Marshal(TicketBookingConfirmedEvent{
 					Header: Header{
 						ID:          uuid.NewString(),
 						PublishedAt: time.Now().Format(time.RFC3339),
@@ -228,29 +242,28 @@ func main() {
 					continue
 				}
 
-				msg := message.NewMessage(watermill.NewUUID(), ticketBookingEvent)
-				if err := publisher.Publish(TicketBookingConfirmed, msg); err != nil {
-					return err
-				}
-			} else {
-				ticketCanceledEvent, err := json.Marshal(TicketBookingCanceledEvent{
+				topic = TicketBookingConfirmed
+				msg = message.NewMessage(watermill.NewUUID(), ticketBookingEvent)
+			case StatusCanceled:
+				var ticketCanceledEvent []byte
+				ticketCanceledEvent, err = json.Marshal(TicketBookingCanceledEvent{
 					Header: Header{
 						ID:          uuid.NewString(),
 						PublishedAt: time.Now().Format(time.RFC3339),
 					},
 					Ticket: ticket,
 				})
-				if err != nil {
-					logger.Error("error marshalling IssueReceiptRequest", err, watermill.LogFields{"ticket": ticket})
-					continue
-				}
 
-				msg := message.NewMessage(watermill.NewUUID(), ticketCanceledEvent)
-				if err := publisher.Publish(TicketBookingCanceled, msg); err != nil {
-					return err
-				}
+				topic = TicketBookingCanceled
+				msg = message.NewMessage(watermill.NewUUID(), ticketCanceledEvent)
+			default:
+				return fmt.Errorf("unknown ticket status: %v", ticket.Status)
+			}
+			if err != nil {
+				logger.Error("error marshalling ticket event", err, watermill.LogFields{"ticket": ticket, "topic": topic})
 			}
 
+			return publisher.Publish(topic, msg)
 		}
 
 		return c.NoContent(http.StatusOK)
