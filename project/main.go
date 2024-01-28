@@ -20,6 +20,7 @@ import (
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
+	"github.com/lithammer/shortuuid/v3"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -122,19 +123,35 @@ type TicketBookingCanceledEvent struct {
 	Ticket
 }
 
+type TicketBookingCanceled struct {
+	Header        Header `json:"header"`
+	TicketID      string `json:"ticket_id"`
+	CustomerEmail string `json:"customer_email"`
+	Price         Money  `json:"price"`
+}
+
 const (
 	// Topics.
 
-	// TicketBookingConfirmed is a topic for events published when a ticket booking is confirmed.
-	TicketBookingConfirmed = "TicketBookingConfirmed"
+	// BookingConfirmed is a topic for events published when a ticket booking is confirmed.
+	BookingConfirmed = "TicketBookingConfirmed"
 	// TicketBookingCanceled is a topic for events published when a ticket booking is canceled.
-	TicketBookingCanceled = "TicketBookingCanceled"
+	BookingCanceled = "TicketBookingCanceled"
 
 	// Consumer groups.
 	receiptsConsumerGroup = "receipts"
 	trackerConsumerGroup  = "tracker"
 	refundsConsumerGroup  = "refunds"
 )
+
+func MessageLoggerMiddleware() func(h message.HandlerFunc) message.HandlerFunc {
+	return func(next message.HandlerFunc) message.HandlerFunc {
+		return func(msg *message.Message) ([]*message.Message, error) {
+			logrus.WithField("message_uuid", msg.UUID).Info("Handling a message")
+			return next(msg)
+		}
+	}
+}
 
 func main() {
 	log.Init(logrus.InfoLevel)
@@ -143,7 +160,13 @@ func main() {
 
 	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR")})
 
-	c, err := clients.NewClients(os.Getenv("GATEWAY_ADDR"), nil)
+	c, err := clients.NewClients(
+		os.Getenv("GATEWAY_ADDR"),
+		func(ctx context.Context, req *http.Request) error {
+			req.Header.Set("Correlation-ID", log.CorrelationIDFromContext(ctx))
+			return nil
+		},
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -158,6 +181,23 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	router.AddMiddleware(func(h message.HandlerFunc) message.HandlerFunc {
+		return func(msg *message.Message) (events []*message.Message, err error) {
+			ctx := msg.Context()
+
+			reqCorrelationID := msg.Metadata.Get("correlation_id")
+			if reqCorrelationID == "" {
+				reqCorrelationID = shortuuid.New()
+			}
+
+			ctx = log.ContextWithCorrelationID(ctx, reqCorrelationID)
+
+			msg.SetContext(ctx)
+
+			return h(msg)
+		}
+	})
+	router.AddMiddleware(MessageLoggerMiddleware())
 
 	issueReceiptSub, err := redisstream.NewSubscriber(redisstream.SubscriberConfig{
 		Client:        rdb,
@@ -242,7 +282,7 @@ func main() {
 					continue
 				}
 
-				topic = TicketBookingConfirmed
+				topic = BookingConfirmed
 				msg = message.NewMessage(watermill.NewUUID(), ticketBookingEvent)
 			case StatusCanceled:
 				var ticketCanceledEvent []byte
@@ -254,7 +294,7 @@ func main() {
 					Ticket: ticket,
 				})
 
-				topic = TicketBookingCanceled
+				topic = BookingCanceled
 				msg = message.NewMessage(watermill.NewUUID(), ticketCanceledEvent)
 			default:
 				return fmt.Errorf("unknown ticket status: %v", ticket.Status)
@@ -262,6 +302,8 @@ func main() {
 			if err != nil {
 				logger.Error("error marshalling ticket event", err, watermill.LogFields{"ticket": ticket, "topic": topic})
 			}
+
+			msg.Metadata.Set("correlation_id", c.Request().Header.Get("Correlation-ID"))
 
 			return publisher.Publish(topic, msg)
 		}
@@ -296,8 +338,8 @@ func processIssueReceipt(
 	action func(ctx context.Context, request IssueReceiptRequest) error,
 ) {
 	router.AddNoPublisherHandler(
-		"issue_receipt_handler",
-		TicketBookingConfirmed,
+		"issue_receipt",
+		BookingConfirmed,
 		sub,
 		func(msg *message.Message) error {
 			var req IssueReceiptRequest
@@ -318,14 +360,15 @@ func processTrackerAppend(
 	const spreadsheetName = "tickets-to-print"
 
 	router.AddNoPublisherHandler(
-		"tracker_append_handler",
-		TicketBookingConfirmed,
+		"print_ticket",
+		BookingConfirmed,
 		sub,
 		func(msg *message.Message) error {
 			var payload PrintTicketPayload
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				return err
 			}
+
 			return action(
 				msg.Context(),
 				spreadsheetName,
@@ -343,14 +386,15 @@ func processRefundsAppend(
 	const spreadsheetName = "tickets-to-refund"
 
 	router.AddNoPublisherHandler(
-		"refund_handler",
-		TicketBookingCanceled,
+		"cancel_ticket",
+		BookingCanceled,
 		sub,
 		func(msg *message.Message) error {
-			var payload PrintTicketPayload
+			var payload TicketBookingCanceled
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				return err
 			}
+
 			return action(
 				msg.Context(),
 				spreadsheetName,
