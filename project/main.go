@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -29,9 +30,16 @@ type TicketsStatusRequest struct {
 	Tickets []TicketStatus `json:"tickets"`
 }
 
+type Status string
+
+const (
+	StatusConfirmed Status = "confirmed"
+	StatusCanceled  Status = "canceled"
+)
+
 type TicketStatus struct {
 	TicketID      string `json:"ticket_id"`
-	Status        string `json:"status"`
+	Status        Status `json:"status"`
 	Price         Money  `json:"price"`
 	CustomerEmail string `json:"customer_email"`
 }
@@ -60,13 +68,18 @@ type TicketBookingCanceled struct {
 	Price         Money       `json:"price"`
 }
 
+const (
+	correlationIDHeader      = "Correlation-ID"
+	correlationIDMetadataKey = "correlation_id"
+)
+
 func main() {
 	log.Init(logrus.InfoLevel)
 
-	clients, err := clients.NewClients(
+	newClients, err := clients.NewClients(
 		os.Getenv("GATEWAY_ADDR"),
 		func(ctx context.Context, req *http.Request) error {
-			req.Header.Set("Correlation-ID", log.CorrelationIDFromContext(ctx))
+			req.Header.Set(correlationIDHeader, log.CorrelationIDFromContext(ctx))
 			return nil
 		},
 	)
@@ -74,14 +87,12 @@ func main() {
 		panic(err)
 	}
 
-	receiptsClient := NewReceiptsClient(clients)
-	spreadsheetsClient := NewSpreadsheetsClient(clients)
+	receiptsClient := NewReceiptsClient(newClients)
+	spreadsheetsClient := NewSpreadsheetsClient(newClients)
 
 	watermillLogger := log.NewWatermill(logrus.NewEntry(logrus.StandardLogger()))
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr: os.Getenv("REDIS_ADDR"),
-	})
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_ADDR")})
 
 	pub, err := redisstream.NewPublisher(redisstream.PublisherConfig{
 		Client: rdb,
@@ -122,13 +133,13 @@ func main() {
 
 	e.POST("/tickets-status", func(c echo.Context) error {
 		var request TicketsStatusRequest
-		err := c.Bind(&request)
-		if err != nil {
+		if err := c.Bind(&request); err != nil {
 			return err
 		}
 
 		for _, ticket := range request.Tickets {
-			if ticket.Status == "confirmed" {
+			switch ticket.Status {
+			case StatusConfirmed:
 				event := TicketBookingConfirmed{
 					Header:        NewHeader(),
 					TicketID:      ticket.TicketID,
@@ -142,13 +153,13 @@ func main() {
 				}
 
 				msg := message.NewMessage(watermill.NewUUID(), payload)
-				msg.Metadata.Set("correlation_id", c.Request().Header.Get("Correlation-ID"))
+				msg.Metadata.Set(correlationIDMetadataKey, c.Request().Header.Get(correlationIDHeader))
 
 				err = pub.Publish("TicketBookingConfirmed", msg)
 				if err != nil {
 					return err
 				}
-			} else if ticket.Status == "canceled" {
+			case StatusCanceled:
 				event := TicketBookingCanceled{
 					Header:        NewHeader(),
 					TicketID:      ticket.TicketID,
@@ -162,13 +173,13 @@ func main() {
 				}
 
 				msg := message.NewMessage(watermill.NewUUID(), payload)
-				msg.Metadata.Set("correlation_id", c.Request().Header.Get("Correlation-ID"))
+				msg.Metadata.Set(correlationIDMetadataKey, c.Request().Header.Get(correlationIDHeader))
 
 				err = pub.Publish("TicketBookingCanceled", msg)
 				if err != nil {
 					return err
 				}
-			} else {
+			default:
 				return fmt.Errorf("unknown ticket status: %s", ticket.Status)
 			}
 		}
@@ -185,7 +196,7 @@ func main() {
 		return func(msg *message.Message) (events []*message.Message, err error) {
 			ctx := msg.Context()
 
-			reqCorrelationID := msg.Metadata.Get("correlation_id")
+			reqCorrelationID := msg.Metadata.Get(correlationIDMetadataKey)
 			if reqCorrelationID == "" {
 				reqCorrelationID = shortuuid.New()
 			}
@@ -267,12 +278,12 @@ func main() {
 	})
 
 	errgrp.Go(func() error {
-		// we don't want to start HTTP server before Watermill router (so service won't be healthy before it's ready)
+		// we don't want to start HTTP server before Watermill router. (so service won't be healthy before it's ready)
 		<-router.Running()
 
 		err := e.Start(":8080")
 
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 
@@ -292,7 +303,6 @@ func main() {
 func LoggingMiddleware(next message.HandlerFunc) message.HandlerFunc {
 	return func(msg *message.Message) ([]*message.Message, error) {
 		logger := logrus.WithField("message_uuid", msg.UUID)
-
 		logger.Info("Handling a message")
 
 		return next(msg)
@@ -300,20 +310,13 @@ func LoggingMiddleware(next message.HandlerFunc) message.HandlerFunc {
 }
 
 func NewHeader() EventHeader {
-	return EventHeader{
-		ID:          uuid.NewString(),
-		PublishedAt: time.Now().UTC(),
-	}
+	return EventHeader{ID: uuid.NewString(), PublishedAt: time.Now().UTC()}
 }
 
-type ReceiptsClient struct {
-	clients *clients.Clients
-}
+type ReceiptsClient struct{ clients *clients.Clients }
 
 func NewReceiptsClient(clients *clients.Clients) ReceiptsClient {
-	return ReceiptsClient{
-		clients: clients,
-	}
+	return ReceiptsClient{clients: clients}
 }
 
 type IssueReceiptRequest struct {
@@ -341,14 +344,10 @@ func (c ReceiptsClient) IssueReceipt(ctx context.Context, request IssueReceiptRe
 	return nil
 }
 
-type SpreadsheetsClient struct {
-	clients *clients.Clients
-}
+type SpreadsheetsClient struct{ clients *clients.Clients }
 
 func NewSpreadsheetsClient(clients *clients.Clients) SpreadsheetsClient {
-	return SpreadsheetsClient{
-		clients: clients,
-	}
+	return SpreadsheetsClient{clients: clients}
 }
 
 func (c SpreadsheetsClient) AppendRow(ctx context.Context, spreadsheetName string, row []string) error {
