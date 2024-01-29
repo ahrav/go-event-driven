@@ -18,6 +18,7 @@ import (
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill-redisstream/pkg/redisstream"
 	"github.com/ThreeDotsLabs/watermill/message"
+	"github.com/ThreeDotsLabs/watermill/message/router/middleware"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/lithammer/shortuuid/v3"
@@ -71,6 +72,9 @@ type TicketBookingCanceled struct {
 const (
 	correlationIDHeader      = "Correlation-ID"
 	correlationIDMetadataKey = "correlation_id"
+
+	ticketBookingConfirmed = "TicketBookingConfirmed"
+	ticketBookingCanceled  = "TicketBookingCanceled"
 )
 
 func main() {
@@ -154,8 +158,9 @@ func main() {
 
 				msg := message.NewMessage(watermill.NewUUID(), payload)
 				msg.Metadata.Set(correlationIDMetadataKey, c.Request().Header.Get(correlationIDHeader))
+				msg.Metadata.Set("type", ticketBookingConfirmed)
 
-				err = pub.Publish("TicketBookingConfirmed", msg)
+				err = pub.Publish(ticketBookingConfirmed, msg)
 				if err != nil {
 					return err
 				}
@@ -174,8 +179,9 @@ func main() {
 
 				msg := message.NewMessage(watermill.NewUUID(), payload)
 				msg.Metadata.Set(correlationIDMetadataKey, c.Request().Header.Get(correlationIDHeader))
+				msg.Metadata.Set("type", ticketBookingCanceled)
 
-				err = pub.Publish("TicketBookingCanceled", msg)
+				err = pub.Publish(ticketBookingCanceled, msg)
 				if err != nil {
 					return err
 				}
@@ -202,6 +208,7 @@ func main() {
 			}
 
 			ctx = log.ContextWithCorrelationID(ctx, reqCorrelationID)
+			ctx = log.ToContext(ctx, logrus.WithFields(logrus.Fields{"correlation_id": reqCorrelationID}))
 
 			msg.SetContext(ctx)
 
@@ -209,13 +216,28 @@ func main() {
 		}
 	})
 	router.AddMiddleware(LoggingMiddleware)
+	router.AddMiddleware(middleware.Retry{
+		MaxRetries:      10,
+		InitialInterval: time.Millisecond * 100,
+		MaxInterval:     time.Second,
+		Multiplier:      2,
+		Logger:          watermillLogger,
+	}.Middleware)
 
 	router.AddNoPublisherHandler(
 		"issue_receipt",
-		"TicketBookingConfirmed",
+		ticketBookingConfirmed,
 		issueReceiptSub,
 		func(msg *message.Message) error {
 			var event TicketBookingConfirmed
+			if msg.UUID == "2beaf5bc-d5e4-4653-b075-2b36bbf28949" {
+				return nil
+			}
+
+			if msg.Metadata.Get("type") != ticketBookingConfirmed {
+				return nil
+			}
+
 			err := json.Unmarshal(msg.Payload, &event)
 			if err != nil {
 				return err
@@ -233,10 +255,17 @@ func main() {
 
 	router.AddNoPublisherHandler(
 		"print_ticket",
-		"TicketBookingConfirmed",
+		ticketBookingConfirmed,
 		appendToTrackerSub,
 		func(msg *message.Message) error {
 			var event TicketBookingConfirmed
+			if msg.UUID == "2beaf5bc-d5e4-4653-b075-2b36bbf28949" {
+				return nil
+			}
+			if msg.Metadata.Get("type") != ticketBookingConfirmed {
+				return nil
+			}
+
 			err := json.Unmarshal(msg.Payload, &event)
 			if err != nil {
 				return err
@@ -252,10 +281,14 @@ func main() {
 
 	router.AddNoPublisherHandler(
 		"cancel_ticket",
-		"TicketBookingCanceled",
+		ticketBookingCanceled,
 		cancelTicketSub,
 		func(msg *message.Message) error {
 			var event TicketBookingCanceled
+			if msg.Metadata.Get("type") != ticketBookingCanceled {
+				return nil
+			}
+
 			err := json.Unmarshal(msg.Payload, &event)
 			if err != nil {
 				return err
@@ -301,9 +334,15 @@ func main() {
 }
 
 func LoggingMiddleware(next message.HandlerFunc) message.HandlerFunc {
-	return func(msg *message.Message) ([]*message.Message, error) {
-		logger := logrus.WithField("message_uuid", msg.UUID)
-		logger.Info("Handling a message")
+	return func(msg *message.Message) (msgs []*message.Message, err error) {
+		logger := log.FromContext(msg.Context())
+		defer func() {
+			if err != nil {
+				logger.WithField("error", err).WithField("message_uuid", msg.UUID).Info("Message handling error")
+			}
+		}()
+
+		logger.WithField("message_uuid", msg.UUID).Info("Handling a message")
 
 		return next(msg)
 	}
